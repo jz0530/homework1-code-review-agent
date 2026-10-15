@@ -1,4 +1,4 @@
-"""本地隐藏输入 DeepSeek 密钥并启动，不将密钥保存到磁盘。"""
+"""输入 DeepSeek 密钥后启动助手，密钥不保存到文件。"""
 import getpass
 import os
 

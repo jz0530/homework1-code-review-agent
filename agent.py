@@ -1,7 +1,6 @@
-"""只读代码审查 Agent，Python 3.10+，仅依赖标准库。"""
+"""命令行代码审查助手。"""
 import argparse
 import ast
-import copy
 import json
 import os
 from pathlib import Path
@@ -41,7 +40,7 @@ class ToolBox:
 
     def source(self, path):
         if not isinstance(path, str) or not path or Path(path).is_absolute():
-            raise ValueError("path必须是非空相对路径")
+            raise ValueError("文件路径必须是非空的相对路径")
         candidate = self.root / path
         resolved = candidate.resolve(strict=True)
         if not resolved.is_relative_to(self.root):
@@ -107,14 +106,15 @@ class Client:
         self.base = os.getenv('LLM_BASE_URL', 'https://api.deepseek.com').rstrip('/')
         self.model = os.getenv('LLM_MODEL', 'deepseek-flash')
         if not self.key or not self.base:
-            raise ValueError("请设置 LLM_API_KEY 和 LLM_BASE_URL，详见 README.md")
+            raise ValueError("缺少接口配置。请先运行 python configure_deepseek.py 输入密钥；"
+                             "也可以设置 LLM_API_KEY 和 LLM_BASE_URL 环境变量")
         if urlparse(self.base).scheme != 'https' or not urlparse(self.base).netloc:
             raise ValueError("LLM_BASE_URL 必须是 HTTPS API 地址")
 
     def complete(self, messages):
         body = {"model": self.model, "messages": messages,
                 "tools": TOOLS, "temperature": 0.2, "max_tokens": 2000}
-        # DeepSeek 默认可启用思考；本作业显式使用非思考模式，控制延迟及输出费用。
+        # 关闭思考模式，减少等待时间和输出费用。
         if urlparse(self.base).hostname == 'api.deepseek.com':
             body['thinking'] = {"type": "disabled"}
         payload = json.dumps(body, ensure_ascii=False).encode('utf-8')
@@ -127,7 +127,21 @@ class Client:
                 return body['choices'][0]['message']
             except urllib.error.HTTPError as exc:
                 if exc.code not in {429, 500, 502, 503, 504} or attempt == 2:
-                    raise RuntimeError(f"API请求失败（HTTP {exc.code}），请检查密钥、额度、模型及地址") from None
+                    if exc.code >= 500:
+                        hint = "模型服务端出错，请稍后重试"
+                    elif exc.code == 429:
+                        hint = "请求受到限流，请稍后重试"
+                    elif exc.code == 401:
+                        hint = "密钥无效，请检查 API Key"
+                    elif exc.code == 402:
+                        hint = "账户余额不足，请检查 API 账户余额"
+                    elif exc.code == 403:
+                        hint = "请求被拒绝，请检查账户权限"
+                    elif exc.code == 404:
+                        hint = "接口或模型不存在，请检查地址和模型名称"
+                    else:
+                        hint = "请检查请求参数、模型名称和接口地址"
+                    raise RuntimeError(f"API请求失败（HTTP {exc.code}），{hint}") from None
             except (urllib.error.URLError, TimeoutError):
                 if attempt == 2:
                     raise RuntimeError("网络请求失败或超时，已尝试3次") from None
@@ -145,11 +159,11 @@ class Agent:
     def ask(self, question):
         if not question.strip() or len(question) > 12000:
             raise ValueError("输入须为1至12000字符")
-        # 只提交完整轮次，失败的半轮不会污染下一轮工具协议。
+        # 本轮先单独保存，得到完整回答后再加入历史记录。
         turn = [{"role": "user", "content": question}]
         context = [{"role": "system", "content": SYSTEM}]
         for previous in self.turns:
-            context.extend(copy.deepcopy(previous))
+            context.extend(previous)
         for _ in range(self.max_steps):
             response = self.client.complete(context + turn)
             if not isinstance(response, dict):
@@ -182,11 +196,11 @@ class Agent:
                 result = self.toolbox.call(fn['name'], fn['arguments'])
                 turn.append({"role": "tool", "tool_call_id": call['id'],
                              "content": json.dumps(result, ensure_ascii=False)})
-        raise RuntimeError("已达到6步推理上限，请缩小审查范围后重试")
+        raise RuntimeError(f"已达到{self.max_steps}次模型调用上限，请缩小审查范围后重试")
 
 
 class DemoClient:
-    """固定脚本驱动真实工具，仅用于离线展示流程，不模拟通用智能。"""
+    """不用接口密钥，按固定步骤演示工具调用。"""
     def complete(self, messages):
         if messages[-1]['role'] == 'user':
             return {"content": None, "tool_calls": [
@@ -202,13 +216,17 @@ class DemoClient:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='CodeReview Agent：只读代码审查助手')
-    parser.add_argument('--root', default='examples', help='允许读取的源码根目录')
+    parser = argparse.ArgumentParser(description='代码审查助手')
+    # 默认示例目录跟随脚本位置；--root 指定的相对路径仍从当前终端目录计算。
+    parser.add_argument('--root', default=str(Path(__file__).resolve().parent / 'examples'),
+                        help='要审查的源码目录，默认使用项目内的 examples 文件夹')
     parser.add_argument('--ask', help='单轮问题，不传则进入交互模式')
     parser.add_argument('--demo', action='store_true', help='不联网的固定样例流程演示')
     args = parser.parse_args()
     try:
-        agent = Agent(DemoClient() if args.demo else Client(), ToolBox(args.root))
+        toolbox = ToolBox(args.root)
+        client = DemoClient() if args.demo else Client()
+        agent = Agent(client, toolbox)
         if args.demo or args.ask:
             print(agent.ask(args.ask or '审查buggy.py'))
             return 0

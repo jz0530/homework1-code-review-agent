@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import urllib.error
 
-from agent import Agent, Client, DemoClient, ToolBox
+from agent import Agent, Client, DemoClient, ToolBox, main
 
 
 class AgentTests(unittest.TestCase):
@@ -43,6 +43,24 @@ class AgentTests(unittest.TestCase):
         result = self.box.call('check_python', '{"path":"invalid.py"}')
         self.assertFalse(result['syntax_ok'])
         self.assertEqual(result['line'], 1)
+
+    def test_mutable_default_check_scope(self):
+        code = ('def f(a=[], b={}, c={1}, d=list(), e=dict(), f=set()):\n'
+                '    pass\n')
+        (self.root / 'defaults.py').write_text(code, encoding='utf-8')
+        result = self.box.call('check_python', '{"path":"defaults.py"}')
+        self.assertTrue(result['syntax_ok'])
+        self.assertEqual([w['line'] for w in result['warnings']], [1])
+        (self.root / 'calls.py').write_text(
+            'def f(a=list(), b=dict(), c=set()):\n    pass\n', encoding='utf-8')
+        self.assertEqual(self.box.call('check_python', '{"path":"calls.py"}')['warnings'], [])
+
+    def test_missing_root_checked_before_client(self):
+        with patch('sys.argv', ['agent.py', '--root', str(self.root / 'missing'), '--ask', 'hi']):
+            with patch('agent.Client') as client, patch('builtins.print') as output:
+                self.assertEqual(main(), 1)
+        client.assert_not_called()
+        self.assertIn('missing', str(output.call_args))
 
     def test_memory_bounded_and_used(self):
         class RecordingClient:
@@ -91,6 +109,20 @@ class AgentTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '401'):
                 Client().complete([])
         self.assertEqual(call.call_count, 1)
+
+    @patch.dict('os.environ', {'LLM_API_KEY': 'test-only', 'LLM_BASE_URL': 'https://example.invalid/v1'})
+    def test_http_errors_give_relevant_hints(self):
+        cases = [(503, '服务端', 3), (429, '限流', 3), (402, '余额', 1)]
+        for status, hint, attempts in cases:
+            with self.subTest(status=status):
+                error = urllib.error.HTTPError('https://example.invalid', status, 'test', {}, None)
+                with patch('agent.urllib.request.urlopen', side_effect=error) as call:
+                    with patch('agent.time.sleep'):
+                        with self.assertRaisesRegex(RuntimeError, hint) as result:
+                            Client().complete([])
+                self.assertEqual(call.call_count, attempts)
+                if status >= 500:
+                    self.assertNotIn('密钥', str(result.exception))
 
     def test_fixed_sample_boundaries(self):
         from examples.fixed import average, add_item
